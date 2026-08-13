@@ -7,6 +7,7 @@ Usage: python quick_test.py --url https://your-worker.railway.app
 import argparse
 import requests
 import json
+import uuid
 from datetime import datetime
 
 def main():
@@ -16,7 +17,7 @@ def main():
     args = parser.parse_args()
 
     payload = {
-        "script_id": f"quick-test-{datetime.now().strftime('%H%M%S')}",
+        "script_id": str(uuid.uuid4()),  # Generate a proper UUID
         "title": "Breaking: Major Tech Announcement Today",
         "content": "[EMPHASIS]Breaking news[/EMPHASIS] from Silicon Valley! [PAUSE] A leading technology company has just unveiled its most ambitious project yet. [PAUSE] The new platform promises to reshape how we interact with artificial intelligence. [SOUND:alert] Industry analysts are already calling it a game changer. [PAUSE] Stay ahead of the curve. [EMPHASIS]Subscribe now for daily tech briefs.[/EMPHASIS]",
         "video_type": args.type,
@@ -52,3 +53,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
