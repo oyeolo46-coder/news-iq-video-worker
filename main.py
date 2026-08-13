@@ -127,7 +127,7 @@ class Database:
                 data["quality_score"],
                 data["quality_status"],
             )
-            return row
+            return str(row)  # Convert UUID to string
 
 db = Database(DATABASE_URL)
 
@@ -434,3 +434,4 @@ async def root():
         "endpoints": ["/health", "/generate"],
         "docs": "/docs",
     }
+
