@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 import json
+import ssl
 import asyncio
 import subprocess
 import tempfile
@@ -19,7 +20,7 @@ from contextlib import asynccontextmanager
 import asyncpg
 import boto3
 from botocore.config import Config
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
@@ -55,22 +56,53 @@ WEEKLY = {
 }
 
 # ---------------------------------------------------------------------------
-# Database
+# Database (Lazy Connection with Retry)
 # ---------------------------------------------------------------------------
 
 class Database:
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
+        self._ssl = None
+        if dsn and "railway" in dsn:
+            # Railway PostgreSQL requires SSL
+            self._ssl = ssl.create_default_context()
+            self._ssl.check_hostname = False
+            self._ssl.verify_mode = ssl.CERT_NONE
 
-    async def connect(self):
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+    async def connect(self, max_retries: int = 10):
+        """Connect with retry and backoff."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.pool = await asyncpg.create_pool(
+                    self.dsn,
+                    min_size=1,
+                    max_size=3,
+                    ssl=self._ssl,
+                    command_timeout=30,
+                )
+                print(f"[DB] Connected successfully on attempt {attempt}")
+                return
+            except Exception as e:
+                print(f"[DB] Connection attempt {attempt}/{max_retries} failed: {e}")
+                if attempt == max_retries:
+                    raise
+                wait = min(2 ** attempt, 30)  # Exponential backoff, max 30s
+                print(f"[DB] Retrying in {wait}s...")
+                await asyncio.sleep(wait)
 
     async def close(self):
         if self.pool:
             await self.pool.close()
+            self.pool = None
+
+    async def ensure_connected(self):
+        """Lazy connection - connects on first use."""
+        if self.pool is None:
+            await self.connect()
 
     async def insert_video(self, data: dict) -> str:
+        await self.ensure_connected()
         query = """
         INSERT INTO videos (
             id, script_id, video_type, file_path_local,
@@ -155,7 +187,6 @@ def generate_audio(text: str, output_path: str) -> float:
     tts = gTTS(text=text, lang="en", slow=False)
     tts.save(output_path)
 
-    # Get exact duration via ffprobe
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -249,10 +280,6 @@ def upload_to_bucket(local_path: str, key: str) -> str:
     """Upload file to Railway S3 bucket. Returns public URL."""
     s3 = get_s3_client()
     s3.upload_file(local_path, BUCKET_NAME, key)
-
-    # Build URL from endpoint + bucket + key
-    # Railway buckets are typically: https://{bucket}.{endpoint}/{key}
-    # or via the endpoint directly
     url = f"{BUCKET_ENDPOINT}/{BUCKET_NAME}/{key}"
     return url
 
@@ -265,23 +292,18 @@ def calculate_quality_score(file_size_bytes: int, duration: float, spec: dict) -
     score = 0.0
     file_mb = file_size_bytes / (1024 * 1024)
 
-    # File size (encoding quality indicator)
     if file_mb > 1.0:
         score += 25
     elif file_mb > 0.5:
         score += 15
 
-    # Duration sanity
     if duration > 5:
         score += 25
 
-    # Resolution
     if spec["width"] >= 1080 and spec["height"] >= 1080:
         score += 25
 
-    # Audio present (implicit since we build with audio)
     score += 25
-
     return min(score, 100.0)
 
 # ---------------------------------------------------------------------------
@@ -289,9 +311,6 @@ def calculate_quality_score(file_size_bytes: int, duration: float, spec: dict) -
 # ---------------------------------------------------------------------------
 
 async def generate_video(req: GenerateRequest) -> GenerateResponse:
-    if not db.pool:
-        await db.connect()
-
     spec = DAILY_SHORT if req.video_type == "daily_short" else WEEKLY
     tmp_dir = tempfile.mkdtemp(prefix="news_iq_")
 
@@ -329,7 +348,7 @@ async def generate_video(req: GenerateRequest) -> GenerateResponse:
         quality_score = calculate_quality_score(file_size, duration, spec)
         quality_status = "approved" if quality_score >= 70 else "pending_review"
 
-        # 8. Save to database
+        # 8. Save to database (lazy connect)
         video_id = await db.insert_video({
             "script_id": req.script_id,
             "video_type": req.video_type,
@@ -360,7 +379,6 @@ async def generate_video(req: GenerateRequest) -> GenerateResponse:
         return GenerateResponse(success=False, message=f"Generation failed: {str(e)}")
 
     finally:
-        # Cleanup temp files
         for f in ["voiceover.mp3", "frame.png", "video.mp4"]:
             p = os.path.join(tmp_dir, f)
             if os.path.exists(p):
@@ -368,12 +386,12 @@ async def generate_video(req: GenerateRequest) -> GenerateResponse:
         os.rmdir(tmp_dir)
 
 # ---------------------------------------------------------------------------
-# FastAPI App
+# FastAPI App (No DB required for startup)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db.connect()
+    # Don't connect to DB on startup - do it lazily on first request
     yield
     await db.close()
 
@@ -386,18 +404,24 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    """Health check - does NOT require database."""
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat(),
+        "db_url_set": DATABASE_URL is not None,
+        "bucket_set": BUCKET_NAME is not None,
+    }
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
+async def generate(req: GenerateRequest):
     """
     Generate a video from a script.
-    - Creates MP3 via gTTS (free)
-    - Renders title frame via PIL
-    - Encodes MP4 via FFmpeg
-    - Uploads to Railway bucket
-    - Stores metadata in PostgreSQL
     """
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
+    if not BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="BUCKET_NAME not configured")
+
     result = await generate_video(req)
     if not result.success:
         raise HTTPException(status_code=500, detail=result.message)
